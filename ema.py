@@ -61,7 +61,7 @@ class DhanAPI:
         url = f"{self.base_url}/charts/historical"
         
         to_date = datetime.now()
-        from_date = to_date - timedelta(days=days)   # default: ~200 trading days
+        from_date = to_date - timedelta(days=days)
         
         payload = {
             "securityId": str(stock_config.security_id),
@@ -71,50 +71,54 @@ class DhanAPI:
             "toDate": to_date.strftime("%Y-%m-%d")
         }
         
-        # Add expiry code for futures
         if stock_config.instrument in ["FUTIDX", "FUTSTK", "FUTCOM"] and stock_config.expiry_code:
             payload["expiryCode"] = stock_config.expiry_code
-        
-        # Add OI for futures
         if stock_config.instrument in ["FUTIDX", "FUTSTK", "FUTCOM"]:
             payload["oi"] = True
-        
-        try:
-            response = requests.post(url, json=payload, headers=self.headers, timeout=20)
-            
-            if response.status_code != 200:
-                logger.error(
-                    f"API Error for {stock_config.symbol} ({stock_config.security_id}): "
-                    f"{response.status_code} {response.text}"
-                )
-                return None
+
+        # 🔁 Retry loop for rate limits & network errors
+        for attempt in range(3):
+            try:
+                response = requests.post(url, json=payload, headers=self.headers, timeout=20)
                 
-            data = response.json()
-            
-            if not data or "timestamp" not in data:
-                logger.warning(f"No data field in API response for {stock_config.symbol} ({stock_config.security_id})")
+                if response.status_code == 200:
+                    data = response.json()
+                    if not data or "timestamp" not in data:
+                        logger.warning(f"No data field in API response for {stock_config.symbol} ({stock_config.security_id})")
+                        return None
+                    
+                    df = pd.DataFrame({
+                        "timestamp": data["timestamp"],
+                        "open": data["open"],
+                        "high": data["high"],
+                        "low": data["low"],
+                        "close": data["close"],
+                        "volume": data["volume"]
+                    })
+                    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
+                    df = df.sort_values("datetime").reset_index(drop=True)
+                    return df
+
+                elif response.status_code == 429:  # rate limit
+                    logger.warning(f"Rate limit hit for {stock_config.symbol}, retrying... (attempt {attempt+1}/3)")
+                    time.sleep(2)  # wait before retry
+                    continue
+                else:
+                    logger.error(
+                        f"API Error for {stock_config.symbol} ({stock_config.security_id}): "
+                        f"{response.status_code} {response.text}"
+                    )
+                    return None
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Network error fetching {stock_config.symbol} ({stock_config.security_id}): {e}")
+                time.sleep(2)
+            except Exception as e:
+                logger.error(f"Unexpected error fetching {stock_config.symbol} ({stock_config.security_id}): {e}")
                 return None
-            
-            df = pd.DataFrame({
-                "timestamp": data["timestamp"],
-                "open": data["open"],
-                "high": data["high"],
-                "low": data["low"],
-                "close": data["close"],
-                "volume": data["volume"]
-            })
-            
-            df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
-            df = df.sort_values("datetime").reset_index(drop=True)
-            
-            return df
         
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error fetching {stock_config.symbol} ({stock_config.security_id}): {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error fetching {stock_config.symbol} ({stock_config.security_id}): {e}")
-            return None
+        return None  # if all retries failed
+
 
 
 
@@ -251,26 +255,41 @@ def process_single_stock(stock_config: StockConfig, dhan_api: DhanAPI) -> Option
         st.error(f"❌ Error processing {stock_config.symbol}: {e}")
         return None
 
+def process_single_stock_with_retry(stock_config: StockConfig, dhan_api: DhanAPI, retries: int = 3, delay: float = 2.0) -> Optional[EMAAlert]:
+    """Retry wrapper for processing a single stock to handle rate limits"""
+    for attempt in range(retries):
+        try:
+            alert = process_single_stock(stock_config, dhan_api)
+            if alert or attempt == retries - 1:
+                return alert
+        except Exception as e:
+            logger.warning(f"Retry {attempt+1}/{retries} failed for {stock_config.symbol}: {e}")
+        time.sleep(delay)  # wait before retry
+    return None
 
-def scan_stocks_parallel(stocks: List[StockConfig], dhan_api: DhanAPI, max_workers: int = 8) -> List[EMAAlert]:
-    """Scan stocks in parallel and return alerts"""
+
+
+def scan_stocks_parallel(stocks: List[StockConfig], dhan_api: DhanAPI, max_workers: int = 2) -> List[EMAAlert]:
+    """Scan stocks in parallel with retries and return alerts"""
     alerts = []
-    
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_stock = {
-            executor.submit(process_single_stock, stock, dhan_api): stock 
+            executor.submit(process_single_stock_with_retry, stock, dhan_api): stock
             for stock in stocks
         }
-        
+
         for future in as_completed(future_to_stock):
             try:
-                alert = future.result(timeout=45)
+                alert = future.result(timeout=60)
                 if alert:
                     alerts.append(alert)
             except Exception as e:
-                logger.error(f"Error in parallel processing: {e}")
-    
+                stock = future_to_stock[future]
+                logger.error(f"Error processing {stock.symbol}: {e}")
+
     return alerts
+
 
 # Initialize session state
 if 'last_scan' not in st.session_state:
@@ -560,13 +579,13 @@ def perform_scan(dhan_token: str, telegram_token: str, telegram_chat_id: str, gi
         alerts = []
         processed = 0
         failed = 0
-        batch_size = 20
+        batch_size = 5
         
         for i in range(0, len(stocks), batch_size):
             batch = stocks[i:i + batch_size]
             
             # Process batch
-            batch_alerts = scan_stocks_parallel(batch, dhan_api, max_workers=6)
+            batch_alerts = scan_stocks_parallel(batch, dhan_api, max_workers=2)
             alerts.extend([alert for alert in batch_alerts if alert is not None])
             
             # Count failed stocks (for logging)
