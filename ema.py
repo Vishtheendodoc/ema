@@ -57,31 +57,40 @@ class DhanAPI:
         }
     
     def fetch_historical_data(self, stock_config: StockConfig, days: int = 25) -> Optional[pd.DataFrame]:
+        """Fetch historical data for a single stock (supports futures with expiryCode and OI)"""
         url = f"{self.base_url}/charts/historical"
-
+        
         to_date = datetime.now()
-        from_date = to_date - timedelta(days=days)
-
-        params = {
+        from_date = to_date - timedelta(days=200)   # ~200 trading days ~ 9 months
+        
+        payload = {
             "securityId": str(stock_config.security_id),
             "exchangeSegment": stock_config.exchange_segment,
             "instrument": stock_config.instrument,
             "fromDate": from_date.strftime("%Y-%m-%d"),
             "toDate": to_date.strftime("%Y-%m-%d")
         }
-
+        
+        # Add expiry code for futures
+        if stock_config.instrument in ["FUTIDX", "FUTSTK", "FUTCOM"] and stock_config.expiry_code:
+            payload["expiryCode"] = stock_config.expiry_code
+        
+        # Add OI for futures
+        if stock_config.instrument in ["FUTIDX", "FUTSTK", "FUTCOM"]:
+            payload["oi"] = True
+        
         try:
-            response = requests.get(url, params=params, headers=self.headers, timeout=20)
-
+            response = requests.post(url, json=payload, headers=self.headers, timeout=20)
+            
             if response.status_code != 200:
                 logger.error(f"API Error for {stock_config.symbol}: {response.status_code} {response.text}")
                 return None
-
+                
             data = response.json()
-
+            
             if not data or "timestamp" not in data:
                 return None
-
+            
             df = pd.DataFrame({
                 "timestamp": data["timestamp"],
                 "open": data["open"],
@@ -90,15 +99,16 @@ class DhanAPI:
                 "close": data["close"],
                 "volume": data["volume"]
             })
-
+            
             df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
             df = df.sort_values("datetime").reset_index(drop=True)
-
+            
             return df
-
+            
         except Exception as e:
             logger.error(f"Error fetching data for {stock_config.symbol}: {str(e)}")
             return None
+
 
 
 class EMAAnalyzer:
