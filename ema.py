@@ -56,12 +56,12 @@ class DhanAPI:
             "access-token": access_token
         }
     
-    def fetch_historical_data(self, stock_config: StockConfig, days: int = 25) -> Optional[pd.DataFrame]:
-        """Fetch historical data for a single stock (supports futures with expiryCode and OI)"""
+    def fetch_historical_data(self, stock_config: StockConfig, days: int = 200) -> Optional[pd.DataFrame]:
+        """Fetch historical daily data for a single stock (supports futures with expiryCode and OI)"""
         url = f"{self.base_url}/charts/historical"
         
         to_date = datetime.now()
-        from_date = to_date - timedelta(days=200)   # ~200 trading days ~ 9 months
+        from_date = to_date - timedelta(days=days)   # default: ~200 trading days
         
         payload = {
             "securityId": str(stock_config.security_id),
@@ -83,12 +83,16 @@ class DhanAPI:
             response = requests.post(url, json=payload, headers=self.headers, timeout=20)
             
             if response.status_code != 200:
-                logger.error(f"API Error for {stock_config.symbol}: {response.status_code} {response.text}")
+                logger.error(
+                    f"API Error for {stock_config.symbol} ({stock_config.security_id}): "
+                    f"{response.status_code} {response.text}"
+                )
                 return None
                 
             data = response.json()
             
             if not data or "timestamp" not in data:
+                logger.warning(f"No data field in API response for {stock_config.symbol} ({stock_config.security_id})")
                 return None
             
             df = pd.DataFrame({
@@ -104,10 +108,15 @@ class DhanAPI:
             df = df.sort_values("datetime").reset_index(drop=True)
             
             return df
-            
-        except Exception as e:
-            logger.error(f"Error fetching data for {stock_config.symbol}: {str(e)}")
+        
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error fetching {stock_config.symbol} ({stock_config.security_id}): {e}")
             return None
+        except Exception as e:
+            logger.error(f"Unexpected error fetching {stock_config.symbol} ({stock_config.security_id}): {e}")
+            return None
+
+
 
 
 
@@ -225,6 +234,9 @@ def process_single_stock(stock_config: StockConfig, dhan_api: DhanAPI) -> Option
     try:
         df = dhan_api.fetch_historical_data(stock_config)
         if df is None or df.empty:
+            # ⚠️ Debug: show which stock failed
+            logger.warning(f"⚠️ No data for {stock_config.symbol} ({stock_config.security_id})")
+            st.warning(f"⚠️ No data for {stock_config.symbol} ({stock_config.security_id})")
             return None
         
         alert = EMAAnalyzer.detect_crossover(df, stock_config.fast_ema, stock_config.slow_ema)
@@ -236,7 +248,9 @@ def process_single_stock(stock_config: StockConfig, dhan_api: DhanAPI) -> Option
         return None
     except Exception as e:
         logger.error(f"Error processing {stock_config.symbol}: {str(e)}")
+        st.error(f"❌ Error processing {stock_config.symbol}: {e}")
         return None
+
 
 def scan_stocks_parallel(stocks: List[StockConfig], dhan_api: DhanAPI, max_workers: int = 8) -> List[EMAAlert]:
     """Scan stocks in parallel and return alerts"""
